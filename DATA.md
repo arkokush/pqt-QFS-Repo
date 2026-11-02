@@ -2,6 +2,10 @@
 
 What each file and column of the data pack means. The full rules are in [STRATEGY_GUIDE.md](STRATEGY_GUIDE.md).
 
+**The data pack is not released yet.** It will be attached to this repository's
+[release](https://github.com/tom05919/pqt-student-kit/releases/tag/v0.2.0) soon as
+`pqt-data-pack.zip`; this page already describes its files, so you can write your loaders now.
+
 24 sessions of 45 minutes, generated before the competition by the competition's bot code, with
 parameters drawn afresh for each session from the same distribution as the live sessions. Your
 orders and other teams' are not in them. They hold no news, no halts and no client codes, and

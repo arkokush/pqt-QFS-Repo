@@ -16,20 +16,16 @@ pqt --help
 
 ## 2. Get the data
 
-Download the historical data and unzip it here, so that you have `data/manifest.json`,
-`data/s01.top.csv` and so on (24 sessions, `s01` to `s24`):
-
-```bash
-curl -LO https://github.com/tom05919/pqt-student-kit/releases/download/v0.2.0/pqt-data-pack.zip && unzip pqt-data-pack.zip
-```
-
-(Or download `pqt-data-pack.zip` from the [release](https://github.com/tom05919/pqt-student-kit/releases/tag/v0.2.0) in your browser.)
-[DATA.md](DATA.md) says what every file and column means.
+**The historical data (24 sessions) is not released yet: it will be attached to this
+repository's [release](https://github.com/tom05919/pqt-student-kit/releases/tag/v0.2.0) soon, as
+`pqt-data-pack.zip`.** Unzip it here, so that you have `data/manifest.json`, `data/s01.top.csv` and
+so on. [DATA.md](DATA.md) already says what every file and column means, so you can write your
+loaders now. Until then, try your code live on the sandbox (section 3).
 
 ## 3. Run a strategy
 
 ```bash
-pqt backtest strategies/hello_world.py --data data --name s01    # offline: start here
+pqt backtest strategies/hello_world.py --data data --name s01    # offline, once the data is out
 pqt check --server https://sandbox.princeton-quant.com --key YOUR_KEY
 pqt run strategies/hello_world.py --mode test --server https://sandbox.princeton-quant.com --key YOUR_KEY
 ```
