@@ -2,14 +2,10 @@
 
 What each file and column of the data pack means. The full rules are in [STRATEGY_GUIDE.md](STRATEGY_GUIDE.md).
 
-**The data pack is not released yet.** It will be attached to this repository's
-[release](https://github.com/tom05919/pqt-student-kit/releases/tag/v0.2.0) soon as
-`pqt-data-pack.zip`; this page already describes its files, so you can write your loaders now.
-
-24 sessions of 45 minutes, generated before the competition by the competition's bot code, with
+24 sessions of 45 minutes of the competition's market, generated before the competition, with
 parameters drawn afresh for each session from the same distribution as the live sessions. Your
-orders and other teams' are not in them. They hold no news, no halts and no client codes, and
-nothing about the true value or the bots' parameters.
+orders and other teams' are not in them. They hold no news and no halts, and nothing about the
+true value or the market's parameters.
 
 The pack is a directory with two CSV files per session and one `manifest.json`. The CSV files are
 text with a header row, comma separated; **a blank cell means absent, never zero**. The column names
@@ -36,7 +32,7 @@ order.
 | `qty` | integer shares | |
 | `aggressor` | `BUY` or `SELL` | the side of the arriving order |
 | `self_trade` | `true` or `false` | both sides were the same participant |
-| `buyer_id`, `seller_id` | text, or blank | client codes; always blank in the historical data |
+| `aux` | a JSON object | extra information about the trade, as in the API's `aux`; always `{}` in the historical data |
 
 **`manifest.json`**: `format` (`pqt.history/2`), `batch_ms` (500), `n_batches` (5,400), `symbols`
 (each with `tick_size`, `position_limit`, `max_order_qty` and `exposure_weight_milli`, the weight
@@ -49,7 +45,8 @@ batch,symbol,bid_px,bid_qty,ask_px,ask_qty,status
 ```
 
 The last trade price is not a column: it is the latest row of the trades file for that symbol. Any
-CSV reader works (`pandas.read_csv`), or let the SDK read and check the files:
+CSV reader works (`pandas.read_csv`, say; pandas does not come with the SDK: `pip install pandas`),
+or let the SDK read and check the files:
 
 ```python
 from pqt_client.backtest_v2 import load_manifest, load_session

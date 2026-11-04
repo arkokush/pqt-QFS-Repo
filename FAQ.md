@@ -20,6 +20,13 @@ once, or use Command Prompt and `.venv\Scripts\activate.bat` instead.
 **`pqt: command not found`** (or "not recognized"). The environment is not active in this
 terminal. Every new terminal needs it: `. .venv/bin/activate` (Windows: `.venv\Scripts\activate`).
 
+**Windows PowerShell: `pqt` prints red `NativeCommandError` blocks.** They are not errors. The SDK
+writes its log lines to stderr, and PowerShell shows every stderr line that way. Read the text
+inside: it is the same log line you would see on a Mac.
+
+**Windows Git Bash: Ctrl-C does not stop `pqt`.** Git Bash may not pass Ctrl-C on to `pqt.exe`.
+Run `pqt` from PowerShell or Command Prompt instead, or start it in Git Bash as `winpty pqt ...`.
+
 ## Backtesting
 
 **`error: missing data file data/s01.top.csv`.** Put the data pack's files in `data/` (so that
@@ -61,13 +68,16 @@ from the current kit.
 
 **`WARN your clock is ... ms from the server's`.** Turn on your computer's automatic time setting.
 
-**`pqt run` says "running ... Ctrl-C to stop" and nothing happens.** The session has not started
-yet; your program waits for it. The sandbox starts a new session shortly after the last one ends.
+**`pqt run` says "connected as ...: session ... is ARMED" and nothing happens.** The session has
+not started yet; your program waits for it and prints a line when it starts. The sandbox starts a
+new session shortly after the last one ends. After that, `pqt run` prints a line only when the
+session pauses, resumes or ends; the trader GUI shows what your program does.
 
 **The connection dropped.** You do not need to do anything: the SDK reconnects by itself, and if
 the network goes silent without a word (a Wi-Fi drop) it notices within 5 seconds. While you are
 away the market goes on, and **your resting orders stay in it** and can still fill. If you would
-rather have them cancelled when your connection is lost, run with `--cancel-on-disconnect`.
+rather have them cancelled when your connection is lost, run with `--cancel-on-disconnect` (in the
+trader GUI, tick the box under the login code).
 
 **I stopped my program, and my orders are still in the book.** That is the rule: orders persist
 until they fill, you cancel them, or the session ends. Cancel them in the trader GUI, or start your
@@ -113,11 +123,22 @@ price.
 **A replace sent my order to the back of the queue.** A cancel-replace keeps its place only if it
 reduces the size at the same price. Leave an order alone when it is where you want it.
 
+**My quoting strategy gets `UNKNOWN_ORDER` rejects** (the starter `market_maker.py` too). Your program
+moved or cancelled a quote that had already filled in the same batch, so the exchange had no such
+order left. A few of these are normal for a strategy that requotes; your next batch sees the fill.
+Many of them mean your program acts on orders it has not checked are still open.
+
 ## The trader GUI and your PnL
 
 **Where is it?** At the exchange's address followed by `/trade/`: for the sandbox,
 https://sandbox.princeton-quant.com/trade/. Log in with your own login code. It shows the same
 account as your programs: positions, orders and fills from every login and key of your team.
+
+**My cash is negative, or we started with no money.** That is the rule: every team starts each
+session with $0 cash and no shares, and there is no cash limit. Buying makes cash negative by what
+the shares cost; it is not a debt, since you hold the shares. What limits you is shares: the
+position and exposure limits in section 6 of the guide. Watch estimated PnL, not cash. There is no
+loss limit either: set your own kill switch if you want one.
 
 **The PnL I see is not my official score.** The PnL shown live is estimated: your cash plus your
 positions marked to the microprice. The official score marks each fill against the true value 60
@@ -132,5 +153,6 @@ holder can release it.
 
 - Use a wired network if you can, keep the laptop plugged in, and stop it from sleeping (on a Mac,
   `caffeinate -i` in another terminal; on Windows, the power settings).
-- One program per algorithm key; give each program its own key if you run several.
+- One key is one connection: a second program with the same key closes the first (code 4001,
+  `SUPERSEDED`). Give each program its own algorithm key if you run several.
 - Start your program again for every session.

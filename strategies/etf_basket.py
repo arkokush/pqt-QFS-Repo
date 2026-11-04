@@ -22,8 +22,12 @@ converts every complete unit and closes what is left with IOC orders at the touc
 limit (600) caps a conversion at 300 HPPO; its largest order (120) caps a clip at 60. While HPPO is
 halted nothing can be converted, so the file waits.
 
-The books rarely cross by that much, and others look for it too. The interesting use of the basket
-is as one input to your own fair value of HPPO (and of the basket from HPPO).
+In the historical data the books cross by that much in a few percent of batches, for a few seconds
+at a time, and this file makes a little in a backtest. Live, every team sees the same gap: when
+several chase it in one batch, some get only part of their legs (BRRY's book is thin), and closing
+those at the touch can cost more than the gap. A backtest cannot show that (section 11 of the
+guide). The interesting use of the basket is as one input to your own fair value of HPPO (and of
+the basket from HPPO).
 """
 
 from pqt_client.v2 import BatchState, Strategy

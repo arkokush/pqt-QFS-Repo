@@ -18,7 +18,7 @@ pqt run my_strategy.py --mode live --server https://competition-url --key YOUR_K
 
 ## 1. The market
 
-Four symbols trade in one market shared by all 60 to 70 teams and the exchange's bots:
+Four symbols trade in one market shared by all 60 to 70 teams and other participants:
 
 | symbol | what it is | position limit (± shares) | largest order | exposure weight |
 |---|---|---|---|---|
@@ -32,13 +32,18 @@ Four symbols trade in one market shared by all 60 to 70 teams and the exchange's
   session is divided into five 8-minute **trading days** (minutes 0 to 40) and 5 more minutes of
   trading; the news may count time in days. Trading stops at 45:00, and every resting order
   expires then.
-- **Bots.** Bots of four types trade alongside the teams. How they work is not published. Their
-  parameters are drawn afresh for every session, from the same distribution that generated the
-  historical sessions: you can learn the distribution from the data, never the live draw.
+- **Other participants.** The market has other participants besides the teams. Who they are and
+  how they trade is not published. The market's parameters are drawn afresh for every session,
+  from the same distribution that generated the historical sessions: you can learn the
+  distribution from the data, never the live draw.
 - **The true value.** For each symbol the exchange's simulator keeps a hidden true value V, which
   your score uses (section 7). Nobody sees it during the competition; the V paths are published
   afterwards. HPPO's true value is exactly BNKY's plus twice BRRY's.
 - **Prices** are whole cents (one tick is $0.01); quantities are whole shares (lot size 1).
+- **Money.** Every team starts each session flat: no shares and $0 cash. There is no starting
+  balance and no cash limit: cash goes below zero when you buy and above zero when you sell
+  (selling short is allowed). What you can hold is limited in shares, by the table above and the
+  exposure limit (section 6), never in dollars. There is no loss limit either.
 
 ## 2. How a batch works
 
@@ -46,7 +51,7 @@ The exchange collects every message (new order, cancel, cancel-replace, conversi
 batch and processes them together at its end:
 
 1. It draws a random order of all participants: each team is one participant (all its keys and
-   logins together), each bot instance is one participant.
+   logins together), and so is each of the market's other participants.
 2. Participants are processed in that order; each participant's messages in the order they were
    sent.
 3. Each new order matches against the book by price, then time, where time is (batch, rank in that
@@ -106,7 +111,7 @@ inside them. A file must define exactly one `Strategy` subclass, or you choose w
 | `on_end(state)` | after the last batch |
 
 Facts the SDK fills in before `on_start` (read-only): `self.team_id`, `self.mode` (`"backtest"`,
-`"test"` or `"live"`), `self.session` (`session_id`, `n_batches`, `batch_ms`, `ids_visible`),
+`"test"` or `"live"`), `self.session` (`session_id`, `n_batches`, `batch_ms`),
 `self.symbols`, `self.symbol_info[symbol]` (`tick_size`, `position_limit`, `max_order_qty`,
 `exposure_weight_milli`), `self.limits` (the team-wide limits and fees), and `self.log`, a logger
 to use instead of `print`. `BatchState` is rebuilt every batch: keep any history in your own
@@ -120,7 +125,7 @@ attributes.
 |---|---|
 | `state.batch`, `state.n_batches`, `state.batches_left`, `state.minute`, `state.final` | where you are in the session |
 | `state.top[symbol]` | the **top of book**: `bid_px`, `bid_qty`, `ask_px`, `ask_qty` (None when that side is empty), `status`, `last` (last trade price); and `mid`, `spread`, `microprice`, `two_sided`, `halted`. No deeper levels are published |
-| `state.trades` | every trade in the market this batch (the public tape): `symbol`, `price`, `qty`, `aggressor`, `self_trade`, `buyer_id`, `seller_id` |
+| `state.trades` | every trade in the market this batch (the public tape): `symbol`, `price`, `qty`, `aggressor`, `self_trade`, `aux` |
 | `state.news`, `state.news_stack` | news published with this batch; every item so far, oldest first |
 | `state.portfolio` | your team's `positions`, `cash_mills`, `fees_mills`, `penalties_mills`, `realized_pnl_mills`, `pnl_est_mills` |
 | `state.position(symbol)`, `state.open_orders`, `state.orders(symbol)` | your position; your team's resting orders (every key's) |
@@ -132,17 +137,17 @@ PnL are integer **mills**, tenths of a cent (`5_460` is $5.46), because the fees
 
 **Trading status.** Each symbol's `status` is `TRADING`, `HALTED` or `CLOSED` (before the first
 and after the last batch). While a symbol is halted its resting orders are cancelled (reason
-`HALT`), new orders on it are refused (`HALTED`), and its price fields keep their last values; for
-HPPO, conversion is refused too. Code that relies on a price must check `top.halted`.
+`HALT`), new orders on it are refused (`HALTED`), its bid and ask are empty and `last` keeps its
+pre-halt value; for HPPO, conversion is refused too. Code that relies on a price must check
+`top.halted`.
 
 **News** items are free text: a `headline`, a `body` and the `batch` they were published in. They
 say nothing machine-readable about which symbol they concern or which way: reading them is your
 job. A program that connects late receives the whole stack.
 
-**Client codes.** `buyer_id` and `seller_id` on trades and fills are null unless the session shows
-client codes (`state.session.ids_visible`). When it does, every participant trades under codes
-that are redrawn every session; team and bot codes look alike, and your own code is one side of
-each of your fills.
+**`aux`.** Every trade on the tape and every one of your fills carries `aux`, a dictionary of
+extra information about the trade, often empty. Your code must not assume that any key is present
+(use `trade.aux.get(...)`, never `trade.aux[...]`). In the historical data it is always `{}`.
 
 **Estimated PnL** (`pnl_est_mills`, and the GUI's PnL) is cash plus your positions marked to each
 symbol's **microprice**, (bid × ask size + ask × bid size) / (bid size + ask size), from the public
@@ -151,6 +156,28 @@ is **not your score**, which needs the true value (section 7).
 
 **Never shown during a session:** the true value V, anything derived from the simulator's pricing
 model, and the official score, to you or anyone.
+
+**The objects and their fields.** Everything the SDK hands you is read-only and has exactly these
+fields. `side`, `aggressor`, `status`, `liquidity`, `order_type`, `code`, `reason`, `kind` and
+`phase` are string enums, so `fill.side == "BUY"` works.
+
+| object | where you get it | fields |
+|---|---|---|
+| `TopView` | `state.top[symbol]` | `symbol`, `bid_px`, `bid_qty`, `ask_px`, `ask_qty` (None when that side is empty), `status`, `last`; and `mid`, `spread`, `microprice`, `two_sided`, `halted` |
+| `OpenOrder` | `state.open_orders`, `state.orders(symbol)`, `self.open_orders(symbol)` | `order_id`, `client_id`, `symbol`, `side`, `price`, `remaining` (the shares still resting; there is no `qty`) |
+| `Fill` | `on_fill(fill)` | `batch`, `order_id`, `client_id`, `symbol`, `side`, `price`, `qty` (the shares in this fill), `liquidity` (`MAKER` or `TAKER`), `fee_mills` (positive a charge, negative a rebate), `remaining` (what is left of the order), `self_trade`, `penalty_mills`, `aux` |
+| `Trade` | `state.trades` | `batch`, `symbol`, `price`, `qty`, `aggressor` (the side of the arriving order), `self_trade`, `aux` |
+| `Ack` | `on_ack(ack)` | `batch`, `order_id`, `client_id`, `symbol`, `side`, `order_type` (`LIMIT`, `IOC` or `MARKET`), `price` (for a market order, the cap the exchange applied), `qty` |
+| `Reject` | `on_reject(reject)` | `batch`, `code` (section 6), `client_id`, `order_id`, `detail`; any but `code` and `detail` may be None |
+| `Cancelled` | `on_cancelled(cancelled)` | `batch`, `order_id`, `client_id`, `symbol`, `side`, `reason` (`USER`, `SYSTEM`, `KILL_SWITCH`, `IOC_REMAINDER`, `HALT` or `SESSION_END`), `remaining` (the shares cancelled) |
+| `Replaced` | `on_replaced(replaced)` | `batch`, `order_id`, `client_id`, `symbol`, `side`, `price`, `qty` (the new remaining size), `kept_priority` |
+| `Converted` | `on_converted(converted)` | `batch`, `client_id`, `kind` (`CREATE` or `REDEEM`), `qty` (HPPO shares), `fee_mills` |
+| `NewsItem` | `on_news(item)`, `state.news`, `state.news_stack` | `news_id`, `batch`, `headline`, `body` |
+| `RoundState` | `on_round_state(round_state)` | `phase` (`IDLE` or `ARMED` before the start, then `RUNNING`, `PAUSED`, `ENDED`), `n_batches`, `batch`, `text` |
+| `Broadcast` | `on_broadcast(broadcast)` | `text`, `level` |
+| `LimitUsage` | `state.limit_usage` | `exposure_low`, `exposure_high` (worst-case net exposure, in thousandths), `symbols[symbol]` with `long_worst`, `short_worst`, `open_orders` |
+| `LimitsInfo` | `self.limits`, `state.limits` | `exposure_limit`, `max_open_orders_per_symbol`, `max_msgs_per_batch`, `market_cap_bps`, `taker_fee_mills`, `maker_rebate_mills`, `conversion_fee_mills`, `self_trade_penalty_mills`, `etf`, `basket` |
+| `KillSwitch` | `self.kill_switch` | `realized_pnl_floor_mills` (None: off), `engaged` |
 
 ## 5. What you can do
 
@@ -206,6 +233,13 @@ with short CRRT adds up. One HPPO weighs exactly what 1 BNKY + 2 BRRY weigh, so 
 moves E. The exchange computes the highest and lowest E you could reach if every open order filled,
 and rejects an order that would take either past ±600. Fills therefore never breach a limit; the
 price is that resting quotes on both sides use up limit capacity.
+
+**Cash** starts every session at $0 and has no limit. Each share you buy lowers it by the price and
+each share you sell raises it, so a long position shows as negative cash and a short one as
+positive. Negative cash is not a debt: it is what you paid for the shares you hold. Estimated PnL
+(cash plus your positions marked to the microprice, section 4) says how you are doing, and your
+score is your markouts (section 7). The share limits above are what cap your cash: about half a
+million dollars either way at typical prices.
 
 There is **no loss limit**. Your team may set its own kill switch (section 8), and the organisers
 can halt any team (cancel its orders and refuse new ones: `state.blocked`, rejects `BLOCKED`).
@@ -318,12 +352,15 @@ competition.
   −$2,000 on your team's **realized** PnL (`portfolio.realized_pnl_mills`); `None` turns it off.
   When realized PnL falls to the floor, the exchange cancels the team's resting orders and refuses
   new ones (`BLOCKED`) until the floor is lowered or cleared; `self.kill_switch.engaged` says so. It
-  applies to the whole team, stays set for later sessions until you change it, and is not a trading
-  message; backtests apply it too.
+  applies to the whole team for the rest of the session it was set in (an exchange restart keeps
+  it). R1 and R2 each start with it off, so set it in each session, for example in `on_start`; on
+  the sandbox it carries from one session to the next. It is not a trading message; backtests
+  apply it too.
 - **Disconnects.** Your resting orders **stay** in the market when your program disconnects or
   stops (Ctrl-C included); the market goes on without you. To have a key's orders cancelled when
-  its connection is lost, opt in: `pqt run ... --cancel-on-disconnect`. The SDK sends a heartbeat
-  every second; the exchange drops a connection it has not heard from for 5 seconds. The SDK
+  its connection is lost, opt in: `pqt run ... --cancel-on-disconnect` (in the trader GUI, tick the
+  box under the login code). The SDK sends a heartbeat every second; the exchange drops a
+  connection it has not heard from for 15 seconds. The SDK
   reconnects by itself (after 0.5 s, then longer, up to 5 s), catches up from a snapshot, and calls
   `on_reconnect`.
 - **If the exchange restarts or fails** during a session, every symbol is halted and every resting
@@ -340,9 +377,9 @@ competition.
 
 https://sandbox.princeton-quant.com is a test exchange that opens before the competition, so you
 can check your connection, your order entry and the API. Sessions of 45 minutes run back to back
-while it is up. It has the competition's symbols, rules, limits, fees and API, but **placeholder
-bots that differ from the real ones**, and placeholder prices: nothing learned there about prices
-or bots transfers to the competition. It publishes a test news item now and then, and the
+while it is up. It has the competition's symbols, rules, limits, fees and API, but its other
+participants and its prices are **placeholders that differ from the real ones**: nothing learned
+there about them transfers to the competition. It publishes a test news item now and then, and the
 organisers may halt a symbol there so you can test that your code copes.
 
 ```bash
@@ -352,10 +389,10 @@ pqt run strategies/hello_world.py --mode test --server https://sandbox.princeton
 
 ## 10. The historical data
 
-24 sessions of 45 minutes, generated before the competition by the competition's bot code, with
+24 sessions of 45 minutes of the competition's market, generated before the competition, with
 parameters drawn afresh for each session from the same distribution as the live sessions. Your
-orders and other teams' are not in them. They hold no news, no halts and no client codes, and
-nothing about the true value or the bots' parameters.
+orders and other teams' are not in them. They hold no news and no halts, and nothing about the
+true value or the market's parameters.
 
 The pack is a directory with two CSV files per session and one `manifest.json`. The CSV files are
 text with a header row, comma separated; **a blank cell means absent, never zero**. The column names
@@ -382,7 +419,7 @@ order.
 | `qty` | integer shares | |
 | `aggressor` | `BUY` or `SELL` | the side of the arriving order |
 | `self_trade` | `true` or `false` | both sides were the same participant |
-| `buyer_id`, `seller_id` | text, or blank | client codes; always blank in the historical data |
+| `aux` | a JSON object | extra information about the trade, as in the API's `aux`; always `{}` in the historical data |
 
 **`manifest.json`**: `format` (`pqt.history/2`), `batch_ms` (500), `n_batches` (5,400), `symbols`
 (each with `tick_size`, `position_limit`, `max_order_qty` and `exposure_weight_milli`, the weight
@@ -395,7 +432,8 @@ batch,symbol,bid_px,bid_qty,ask_px,ask_qty,status
 ```
 
 The last trade price is not a column: it is the latest row of the trades file for that symbol. Any
-CSV reader works (`pandas.read_csv`), or let the SDK read and check the files:
+CSV reader works (`pandas.read_csv`, say; pandas does not come with the SDK: `pip install pandas`),
+or let the SDK read and check the files:
 
 ```python
 from pqt_client.backtest_v2 import load_manifest, load_session
@@ -411,16 +449,33 @@ trades = session.trades[0]  # the trades of batch 0
 | | speed | what it tells you | what it cannot |
 |---|---|---|---|
 | **backtest** | seconds | how your logic fares on the historical sessions | impact: your orders never move the recorded market, and nobody reacts to you |
-| **test mode** (the sandbox) | real time | that your program connects, trades and survives the rules and the API | anything about the real bots or prices |
+| **test mode** (the sandbox) | real time | that your program connects, trades and survives the rules and the API | anything about the real market's other participants or prices |
 
 **Backtest.** `pqt backtest` replays one session through the same SDK core as a live connection,
-with the exchange's checks (limits, fees, the message budget, halts). Its fill model is
-conservative and approximate, because the data has only the top of book and your orders are not in
-it:
+with the exchange's checks (limits, fees, the message budget, halts).
+
+**What a backtest cannot show.** The recorded market never reacts to your orders: nobody trades
+with your quotes because they are there, nobody takes a price before you, nobody moves away. So:
+
+- **Resting quotes look far better than they will live.** The recorded trades happened without
+  your quotes in the book. Live, the participants who trade with a quote are often the ones who
+  expect the price to move against it, and stale quotes are picked off first. A quoting strategy
+  that makes money in a backtest can lose it live.
+- **IOC and market orders are never beaten to the price.** An order you send after batch b meets
+  the touch recorded at the end of batch b, the one you saw, whatever happened in batch b+1. It
+  fills at that price, in full whenever that touch was big enough. Live, participants ahead of you
+  in the batch's order may take or move that touch first, so an IOC can fill partly or not at all.
+  A backtest therefore shows no leg risk: every leg of an arbitrage fills there, while live one
+  leg can fill and another not.
+
+The fill model in full, approximate because the data has only the top of book and your orders are
+not in it:
 
 - a marketable order (IOC, market, or the crossing part of a limit order) fills against the touch
-  you saw, at its price, up to its size; each touch's size is used once per batch, and the rest of
-  an IOC or market order is cancelled;
+  recorded at the end of the previous batch (the one you saw), at its price, up to its size; each
+  touch's size is used once per batch by all your orders on that side together. Nothing deeper
+  than the touch is in the data, so a market order never fills beyond it, and the rest of an IOC
+  or market order is cancelled (`IOC_REMAINDER`);
 - a resting order fills only when a recorded trade in a later batch prints **strictly through** its
   price (a trade at exactly your price does not fill you: your queue position is unknown), at your
   price, each trade filling at most its own size;
@@ -431,11 +486,11 @@ it:
   last microprices.
 
 ```console
-$ pqt backtest market_maker.py --data data --name s01
+$ pqt backtest strategies/market_maker.py --data data --name s01
 MarketMaker on s01: 5400 batches (45 min)
-  estimated PnL $367.22 (marked to the final microprices), realized $358.77, fees $-24.85
-  fills 291 (12,424 shares), rejects: none
-  final positions {'BNKY': 88}
+  estimated PnL $470.05 (marked to the final microprices), realized $466.43, fees $-52.01
+  fills 732 (26,007 shares), rejects: none
+  final positions {'BNKY': 145}
   (approximate: top of book only, and your orders never move the recorded market; this is not the official score)
 ```
 
@@ -456,11 +511,11 @@ for name in load_manifest("data").sessions:
 
 ## 12. What we do not tell you
 
-Deliberately not published: how the bots work beyond there being four types of them, their
-parameters, and the distributions those are drawn from (the historical data is generated from the
-same distributions, so learning them from it is part of the competition); the parameters of any
-live session; and the true value, until after the competition. Everything a session holds beyond
-its rules is for you to observe, in the market data and in the news, as it happens.
+Deliberately not published: who the market's other participants are and how they trade, the
+market's parameters, and the distributions those are drawn from (the historical data is generated
+from the same distributions, so learning them from it is part of the competition); the parameters
+of any live session; and the true value, until after the competition. Everything a session holds
+beyond its rules is for you to observe, in the market data and in the news, as it happens.
 
 ## 13. Running in the competition
 
@@ -470,7 +525,9 @@ its rules is for you to observe, in the market data and in the news, as it happe
   it waits for the start.
 - **Use a wired network** if you can, keep the laptop plugged in and awake. Latency of tens of
   milliseconds does not matter with 500 ms batches; dropped connections do.
-- **One program per key.** Give each program its own key if you run several.
+- **One key is one connection.** A second program started with the same key, or a second copy of
+  yours, closes the first one's connection (code 4001, `SUPERSEDED`; it does not reconnect).
+  Give each program its own algorithm key if you run several (`pqt check` does not count).
 - Remember that your resting orders stay when your program stops, unless you chose
   `--cancel-on-disconnect`.
 

@@ -5,37 +5,88 @@ four example strategies, the historical data and the guides. You need Python 3.1
 
 ## 1. Install the SDK
 
-The SDK is two Python packages, attached to this repository's [release](https://github.com/tom05919/pqt-student-kit/releases/tag/v0.2.0):
+The SDK is two Python packages, attached to this repository's [release](https://github.com/tom05919/pqt-student-kit/releases/tag/v0.2.3). On macOS or
+Linux:
 
 ```bash
-python -m venv .venv && . .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install "https://github.com/tom05919/pqt-student-kit/releases/download/v0.2.0/pqt_protocol-0.2.0-py3-none-any.whl" \
-            "https://github.com/tom05919/pqt-student-kit/releases/download/v0.2.0/pqt_client-0.2.0-py3-none-any.whl"
+python -m venv .venv && . .venv/bin/activate
+pip install "https://github.com/tom05919/pqt-student-kit/releases/download/v0.2.3/pqt_protocol-0.2.3-py3-none-any.whl" \
+            "https://github.com/tom05919/pqt-student-kit/releases/download/v0.2.3/pqt_client-0.2.3-py3-none-any.whl"
 pqt --help
 ```
 
+On Windows, in PowerShell (if it refuses to run the activation script, see [FAQ.md](FAQ.md)):
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install "https://github.com/tom05919/pqt-student-kit/releases/download/v0.2.3/pqt_protocol-0.2.3-py3-none-any.whl" "https://github.com/tom05919/pqt-student-kit/releases/download/v0.2.3/pqt_client-0.2.3-py3-none-any.whl"
+pqt --help
+```
+
+Every new terminal needs the activation line again before `pqt` works.
+
+**From the kit's `release/` folder.** If your copy of the kit has a `release/` folder beside this
+one (the two wheels and `pqt-data-pack.zip`), you can install from it instead. On macOS or Linux:
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install ../release/pqt_protocol-0.2.3-py3-none-any.whl \
+            ../release/pqt_client-0.2.3-py3-none-any.whl
+unzip ../release/pqt-data-pack.zip
+```
+
+On Windows, in PowerShell:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install ..\release\pqt_protocol-0.2.3-py3-none-any.whl ..\release\pqt_client-0.2.3-py3-none-any.whl
+tar -xf ..\release\pqt-data-pack.zip
+```
+
+The last line puts the data in `data/`: skip section 2.
+
 ## 2. Get the data
 
-**The historical data (24 sessions) is not released yet: it will be attached to this
-repository's [release](https://github.com/tom05919/pqt-student-kit/releases/tag/v0.2.0) soon, as
-`pqt-data-pack.zip`.** Unzip it here, so that you have `data/manifest.json`, `data/s01.top.csv` and
-so on. [DATA.md](DATA.md) already says what every file and column means, so you can write your
-loaders now. Until then, try your code live on the sandbox (section 3).
+Download the historical data and unzip it here, so that you have `data/manifest.json`,
+`data/s01.top.csv` and so on (24 sessions, `s01` to `s24`). On macOS
+or Linux:
+
+```bash
+curl -LO https://github.com/tom05919/pqt-student-kit/releases/download/v0.2.3/pqt-data-pack.zip && unzip pqt-data-pack.zip
+```
+
+On Windows, in PowerShell:
+
+```powershell
+curl.exe -LO https://github.com/tom05919/pqt-student-kit/releases/download/v0.2.3/pqt-data-pack.zip
+tar -xf pqt-data-pack.zip
+```
+
+(Or download `pqt-data-pack.zip` from the [release](https://github.com/tom05919/pqt-student-kit/releases/tag/v0.2.3) in your browser and unzip it here.)
+[DATA.md](DATA.md) says what every file and column means.
 
 ## 3. Run a strategy
 
+These are the same in PowerShell:
+
 ```bash
-pqt backtest strategies/hello_world.py --data data --name s01    # offline, once the data is out
+pqt backtest strategies/hello_world.py --data data --name s01    # offline: start here
 pqt check --server https://sandbox.princeton-quant.com --key YOUR_KEY
 pqt run strategies/hello_world.py --mode test --server https://sandbox.princeton-quant.com --key YOUR_KEY
 ```
 
 The **sandbox**, https://sandbox.princeton-quant.com, is a test exchange with the competition's symbols, rules
-and API, but placeholder bots and prices: use it to check that your program connects, trades and
-copes. Your team's **algorithm keys** (for programs, `--key` or the environment variable
+and API, but its other participants and prices are placeholders: use it to check that your
+program connects, trades and copes. Your team's **algorithm keys** (for programs, `--key` or the environment variable
 `PQT_API_KEY`) and each member's **login code** (for the trader GUI) are sent to each team
 separately; keep them secret. While your program runs, the trader GUI at https://sandbox.princeton-quant.com/trade/
 shows your team's orders, fills, positions and estimated PnL, and lets you trade by hand.
+
+Every team starts each session with **$0 cash and no shares**, and there is no cash limit: cash
+goes negative when you buy and positive when you sell. What you can hold is limited in shares
+(position and exposure limits), and there is no loss limit; see the guide's sections 1 and 6.
 
 ## The example strategies
 
@@ -56,4 +107,4 @@ yours.
 - [DATA.md](DATA.md): the historical data, file by file and column by column.
 - [FAQ.md](FAQ.md): when something does not work: installing, connecting, trading.
 
-SDK version 0.2.0.
+SDK version 0.2.3.
