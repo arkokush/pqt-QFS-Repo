@@ -134,6 +134,11 @@ Many of them mean your program acts on orders it has not checked are still open.
 https://sandbox.princeton-quant.com/trade/. Log in with your own login code. It shows the same
 account as your programs: positions, orders and fills from every login and key of your team.
 
+**The GUI says "Disconnected: superseded: another tab logged in with this login code".** A login
+code is open in one place at a time: opening it in another tab or on another computer closes the
+first. Each member logs in with their own login code; teammates can all trade at once, each on
+their own computer, in the same team account.
+
 **My cash is negative, or we started with no money.** That is the rule: every team starts each
 session with $0 cash and no shares, and there is no cash limit. Buying makes cash negative by what
 the shares cost; it is not a debt, since you hold the shares. What limits you is shares: the
@@ -154,5 +159,6 @@ holder can release it.
 - Use a wired network if you can, keep the laptop plugged in, and stop it from sleeping (on a Mac,
   `caffeinate -i` in another terminal; on Windows, the power settings).
 - One key is one connection: a second program with the same key closes the first (code 4001,
-  `SUPERSEDED`). Give each program its own algorithm key if you run several.
+  `SUPERSEDED`). Give each program its own algorithm key if you run several. Likewise, a login
+  code is one trader GUI tab: each member uses their own.
 - Start your program again for every session.
