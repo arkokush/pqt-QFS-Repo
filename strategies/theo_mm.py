@@ -12,9 +12,9 @@ Each batch, for each symbol:
    history kept here, clip them to the training range, and predict the mid's move over the next
    60 s: ``theo = mid + prediction + bias``. ``bias_<SYM>`` is a panel slider (cents) for a
    teammate to lean the theo by hand, for example on news.
-2. **Inventory.** Quote around ``q = theo - skew * position / cap``: when long, both quotes move
-   down, so you sell more easily and buy less.
-3. **Quote.** Join the best bid and ask (or step ``IMPROVE`` ticks inside), but never closer to ``q``
+2. **Inventory.** Quote around ``q = theo - skew_<SYM> * position / cap``: when long, both quotes
+   move down, so you sell more easily and buy less.
+3. **Quote.** Join the best bid and ask (or step ``improve_<SYM>`` ticks inside), but never closer to ``q``
    than ``edge_<SYM>`` cents: ``bid = min(best_bid, q - edge)``, ``ask = max(best_ask, q + edge)``.
    When the theo leans one way, the side that would be picked off steps back by itself.
    A quote is moved (cancel-replace) only when its price should change, so it keeps its queue place.
@@ -54,15 +54,22 @@ MAKER_REBATE_C = 0.2
 
 # Per-symbol settings that are not on the panel.
 CAP = {"HPPO": 300, "BNKY": 1000, "CRRT": 1000, "BRRY": 300}  # stop adding beyond this position
-IMPROVE = {"HPPO": 0, "BNKY": 0, "CRRT": 0, "BRRY": 2}  # ticks inside the best price
 EXPOSURE_SOFT = 500  # HPPO-equivalent shares; the exchange's hard limit is 600
 
-# Panel defaults per symbol: (edge cents, size shares, take margin cents)
+# Panel defaults per symbol (every one is a slider named <setting>_<SYMBOL>):
+#   edge     cents: the closest a quote may sit to q
+#   size     shares per quote
+#   take     cents beyond the fee before crossing (50 = never)
+#   skew     cents of lean at a CAP-sized position
+#   improve  ticks inside the best price (0 = join it)
+# From research/grid_search.py: skew and take as found (interior optimum / no difference);
+# edge and size one step back from the grid's boundary (the backtest's fill model rewards ever
+# tighter, ever bigger quotes); improve 1 (2 and 3 were worse even in the backtest).
 DEFAULTS = {
-    "HPPO": (2.0, 40, 2.0),
-    "BNKY": (1.0, 100, 1.5),
-    "CRRT": (1.5, 100, 1.5),
-    "BRRY": (3.0, 30, 2.0),
+    "HPPO": {"edge": 2.0, "size": 40, "take": 50.0, "skew": 10.0, "improve": 1},
+    "BNKY": {"edge": 1.0, "size": 100, "take": 50.0, "skew": 3.0, "improve": 1},
+    "CRRT": {"edge": 1.0, "size": 100, "take": 50.0, "skew": 3.0, "improve": 1},
+    "BRRY": {"edge": 3.0, "size": 30, "take": 50.0, "skew": 6.0, "improve": 1},
 }
 MAX_ORDER = {"HPPO": 200, "BNKY": 500, "CRRT": 500, "BRRY": 120}
 
@@ -71,14 +78,16 @@ REPORT_EVERY = 120  # batches between status lines (one minute)
 
 
 def _params() -> tuple[ParamSpec, ...]:
-    specs = [ParamSpec("skew", ParamKind.FLOAT, 3.0, 0.0, 20.0)]  # cents of lean at a CAP position
+    specs = []
     for s in SYMBOLS:
-        edge, size, take = DEFAULTS[s]
+        d = DEFAULTS[s]
         specs += [
             ParamSpec(f"on_{s}", ParamKind.BOOL, 1),
-            ParamSpec(f"edge_{s}", ParamKind.FLOAT, edge, 0.0, 20.0),
-            ParamSpec(f"size_{s}", ParamKind.INT, size, 1, MAX_ORDER[s]),
-            ParamSpec(f"take_{s}", ParamKind.FLOAT, take, 0.0, 50.0),
+            ParamSpec(f"edge_{s}", ParamKind.FLOAT, d["edge"], 0.0, 20.0),
+            ParamSpec(f"size_{s}", ParamKind.INT, d["size"], 1, MAX_ORDER[s]),
+            ParamSpec(f"take_{s}", ParamKind.FLOAT, d["take"], 0.0, 50.0),
+            ParamSpec(f"skew_{s}", ParamKind.FLOAT, d["skew"], 0.0, 20.0),
+            ParamSpec(f"improve_{s}", ParamKind.INT, d["improve"], 0, 5),
             ParamSpec(f"bias_{s}", ParamKind.FLOAT, 0.0, -50.0, 50.0),
         ]
     return tuple(specs)
@@ -86,11 +95,12 @@ def _params() -> tuple[ParamSpec, ...]:
 
 class TheoMM(Strategy):
     MODEL_PARAMS = _params()
+    MODEL_PATH: Path = MODEL_FILE  # override (e.g. in a backtest subclass) to load another model
 
     def on_start(self) -> None:
-        if not MODEL_FILE.exists():
-            raise FileNotFoundError(f"{MODEL_FILE} not found: run the export cell in EDA.ipynb first")
-        model = json.loads(MODEL_FILE.read_text())
+        if not self.MODEL_PATH.exists():
+            raise FileNotFoundError(f"{self.MODEL_PATH} not found: run the export cell in EDA.ipynb first")
+        model = json.loads(self.MODEL_PATH.read_text())
         self.model = model["symbols"]
         alpha = 2 / (DEPTH_SPAN + 1)
         self.decay = 1 - alpha
@@ -105,7 +115,7 @@ class TheoMM(Strategy):
         self.fills: list[Fill] = []
         self.rejects: Counter[str] = Counter()
         self.set_kill_switch(KILL_FLOOR_MILLS)
-        self.log.info("loaded theo model for %s from %s", ", ".join(self.model), MODEL_FILE.name)
+        self.log.info("loaded theo model for %s from %s", ", ".join(self.model), self.MODEL_PATH.name)
 
     # ---- the theo ---------------------------------------------------------------------------
 
@@ -187,7 +197,8 @@ class TheoMM(Strategy):
         assert top.bid_px is not None and top.ask_px is not None
         assert top.bid_qty is not None and top.ask_qty is not None
         pos, cap = self.position(s), CAP[s]
-        q = self.theo[s] - p["skew"] * pos / cap
+        q = self.theo[s] - p[f"skew_{s}"] * pos / cap
+        improve = int(p[f"improve_{s}"])
         edge, size, take = p[f"edge_{s}"], int(p[f"size_{s}"]), p[f"take_{s}"]
         buy_room, sell_room = self.room(state, s, Side.BUY, size), self.room(state, s, Side.SELL, size)
 
@@ -195,8 +206,8 @@ class TheoMM(Strategy):
         mine = {side: [o for o in self.open_orders(s) if o.side is side] for side in Side}
         my_bid = mine[Side.BUY][0].price if mine[Side.BUY] else None
         my_ask = mine[Side.SELL][0].price if mine[Side.SELL] else None
-        base_bid = top.bid_px if my_bid == top.bid_px else top.bid_px + IMPROVE[s]
-        base_ask = top.ask_px if my_ask == top.ask_px else top.ask_px - IMPROVE[s]
+        base_bid = top.bid_px if my_bid == top.bid_px else top.bid_px + improve
+        base_ask = top.ask_px if my_ask == top.ask_px else top.ask_px - improve
         bid = min(base_bid, math.floor(q - edge), top.ask_px - 1)
         ask = max(base_ask, math.ceil(q + edge), top.bid_px + 1)
         if ask <= bid:
