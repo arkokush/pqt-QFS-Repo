@@ -21,16 +21,29 @@ Each batch, for each symbol:
 4. **Take.** When ``q`` is beyond the far side of the book by more than the taker fee plus
    ``take_<SYM>`` cents, cross with an IOC of ``tsize_<SYM>`` shares whose limit is the worst price
    ``q`` still justifies, so it sweeps several levels if they are there. ``take`` is 50 (off) by
-   default; while a news move is active the margin is ``ntake_<SYM>`` (3c) instead, so setting
-   ``move_<SYM>`` makes it take aggressively toward your target until the price gets there.
+   default; while a news lean is active and its source trades for real (below), the margin is
+   ``ntake_<SYM>`` (3c) instead, so it takes aggressively toward the target until the price gets there.
 
 **News.** On every item it pulls all resting orders at once (``cancel_all``, one message) and
 stands aside in every symbol; each symbol resumes when its book has settled (spread near its usual
-width, mid steady), after 5 s at least and 30 s at most. The ``move_<SYM>`` slider is your read of
-an item: the total move you expect, in cents (+15 = up 15c). It is counted from the mid when the
-news arrived, and only the part that has not happened yet is added to the theo, so the lean shrinks
-as the market reprices and stops once it has moved that far; it expires after 2 minutes. Setting
-it also ends that symbol's pause. Set it back to 0 to clear it early.
+width, mid steady), after 5 s at least and 30 s at most. Two sources can then lean the theo:
+
+* **Your team** (``move_<SYM>``): the total move you expect, in cents (+15 = up 15c). Counted from
+  the mid when the news arrived; only the part that has not happened yet is added to the theo, so
+  the lean shrinks as the market reprices, never exceeds what you entered, and expires after
+  2 minutes. Setting it ends that symbol's pause and replaces any LLM lean on it; 0 clears it.
+* **The LLM** (``strategies/news_desk.py``): a local Ollama model (``llm_model``: 0 off, 1
+  qwen2.5:7b, 2 qwen2.5:14b) reads each item in a background thread, ~1-2 s. A read with
+  confidence >= ``llm_min`` leans each symbol it names by ``llm_size`` cents in its direction,
+  the same way as a team move (HPPO follows from its basket; a team move on a symbol wins).
+
+``team_trade`` and ``llm_trade`` (0 off, 1 paper, 2 real) say what each source does with its
+calls: **paper** records the aggressive take it would have made (the touch, at ``tsize_<SYM>``
+for the team and half of it for the LLM) and marks it 5 s / 30 s / 60 s later; **real** also
+takes for real. Paper results per source go to the terminal, the per-minute line and
+``logs/paper_trades.csv``; the `news` command shows how often each source was right and how far
+prices moved (its *sensitivity*). Every setting can be changed in the GUI panel or by typing into
+the terminal (``help`` lists the commands); the last change wins.
 
 Position caps (``CAP``) and a soft exposure limit (``EXPOSURE_SOFT``) stop it adding to a position.
 It does nothing for the first 60 batches (30 s): the features need that much history.
@@ -46,11 +59,15 @@ from __future__ import annotations
 import csv
 import json
 import math
+import queue
 import re
+import sys
 from collections import Counter, deque
 from pathlib import Path
 
 from pqt_client.v2 import BatchState, Fill, NewsItem, ParamKind, ParamSpec, Reject, Side, Strategy
+
+from news_desk import HELP, LLM_MODELS, LLM_NAMES, CommandReader, LLMReader, PaperBook, append_row, interpret
 
 MODEL_FILE = Path(__file__).with_name("theo_model.json")
 SYMBOLS = ("HPPO", "BNKY", "CRRT", "BRRY")
@@ -105,13 +122,27 @@ NEWS_LOG = Path(__file__).resolve().parents[1] / "logs" / "news_log.csv"
 NEWS_HORIZONS = (10, 60, 120, 240)  # batches: 5 s, 30 s, 60 s, 2 min
 TICKERS = re.compile(r"\b(HPPO|BNKY|CRRT|BRRY)\b")
 NEWS_FIELDS = (
-    ["session", "mode", "news_id", "batch", "minute", "named", "headline", "body"]
-    + [f"{k}_{s}" for s in SYMBOLS for k in ("mid0", "pred0", *(f"move{h}" for h in NEWS_HORIZONS), "slider")]
+    ["session", "mode", "news_id", "batch", "minute", "named", "headline", "body",
+     "llm_model", "llm_secs", "llm_conf", "llm_used", "llm_reason", "llm_error"]
+    + [f"{k}_{s}" for s in SYMBOLS for k in ("mid0", "pred0", *(f"move{h}" for h in NEWS_HORIZONS), "slider", "llm")]
 )
+# The LLM news reader (strategies/news_desk.py) and the paper book of news trades.
+PAPER_LOG = NEWS_LOG.with_name("paper_trades.csv")
+LLM_MAX_AGE = 20  # batches (10 s): a read arriving later than this after its news is logged, not used
+LLM_TAKE_FRACTION = 0.5  # an LLM take (real or paper) is this share of tsize_<SYM>
+TRADE_MODES = {0: "off", 1: "paper", 2: "real"}  # llm_trade / team_trade
+GLOBAL_DEFAULTS = {"llm_model": 2, "llm_size": 3.0, "llm_min": 0.9, "llm_trade": 1, "team_trade": 1}
 
 
 def _params() -> tuple[ParamSpec, ...]:
-    specs = []
+    g = GLOBAL_DEFAULTS
+    specs = [
+        ParamSpec("llm_model", ParamKind.INT, g["llm_model"], 0, 2),  # 0 off, 1 qwen2.5:7b, 2 qwen2.5:14b
+        ParamSpec("llm_size", ParamKind.FLOAT, g["llm_size"], 0.0, 30.0),  # cents of lean per read
+        ParamSpec("llm_min", ParamKind.FLOAT, g["llm_min"], 0.0, 1.0),  # confidence a read needs
+        ParamSpec("llm_trade", ParamKind.INT, g["llm_trade"], 0, 2),  # 0 off, 1 paper, 2 real takes
+        ParamSpec("team_trade", ParamKind.INT, g["team_trade"], 0, 2),  # 0 off, 1 paper, 2 real takes
+    ]
     for s in SYMBOLS:
         d = DEFAULTS[s]
         specs += [
@@ -132,6 +163,8 @@ def _params() -> tuple[ParamSpec, ...]:
 class TheoMM(Strategy):
     MODEL_PARAMS = _params()
     MODEL_PATH: Path = MODEL_FILE  # override (e.g. in a backtest subclass) to load another model
+    LLM_IN_BACKTEST = False  # backtests never call the LLM (there is no news in the data anyway)
+    SPECS = {p.name: p for p in MODEL_PARAMS}
 
     def on_start(self) -> None:
         if not self.MODEL_PATH.exists():
@@ -159,9 +192,43 @@ class TheoMM(Strategy):
         self.move_anchor: dict[str, float | None] = {s: None for s in SYMBOLS}  # mid the move counts from
         self.move_set_at: dict[str, int] = dict.fromkeys(SYMBOLS, 0)
         self.news_records: list[dict] = []  # this session's items, written when complete
+        # settings typed into the terminal, on top of the panel's values (a GUI change clears them)
+        self.overrides: dict[str, float] = {}
+        # LLM leans: like move_, but from the LLM's read (a team move_ on a symbol replaces it)
+        self.llm_target: dict[str, float] = dict.fromkeys(SYMBOLS, 0.0)
+        self.llm_anchor: dict[str, float | None] = {s: None for s in SYMBOLS}
+        self.llm_set_at: dict[str, int] = dict.fromkeys(SYMBOLS, 0)
+        self.llm_reads: list[dict] = []  # every read this session, for `news`
+        self.llm_status = "off"
+        self.paper = PaperBook(PAPER_LOG, TAKER_FEE_C)
+        self.use_llm = self.mode != "backtest" or self.LLM_IN_BACKTEST
+        self.reader = LLMReader() if self.use_llm else None
+        self.commands = None
+        if self.mode in ("test", "live") and sys.stdin is not None and sys.stdin.isatty():
+            self.commands = CommandReader()
         self.set_kill_switch(KILL_FLOOR_MILLS)
         self.print_news_history()
         self.log.info("loaded theo model for %s from %s", ", ".join(self.model), self.MODEL_PATH.name)
+        self.warm_up_llm()
+        if self.commands is not None:
+            self.log.info("type `help` and Enter for terminal commands")
+
+    def P(self) -> dict:
+        """The settings in force: the panel's values, with anything typed into the terminal on top."""
+        p = self.model_params
+        p.update(self.overrides)
+        return p
+
+    def model_name(self) -> str | None:
+        return LLM_MODELS.get(int(self.P()["llm_model"])) if self.use_llm else None
+
+    def warm_up_llm(self) -> None:
+        name = self.model_name()
+        if self.reader is not None and name:
+            self.llm_status = f"{name}: warming up"
+            self.reader.warmup(name)
+        else:
+            self.llm_status = "off"
 
     # ---- the theo ---------------------------------------------------------------------------
 
@@ -226,17 +293,20 @@ class TheoMM(Strategy):
     def on_batch(self, state: BatchState) -> None:
         self.update_history(state)
         self.track_news(state.batch)
+        self.drain_commands(state)
+        self.drain_llm(state)
+        self.mark_paper(state)
         self.check_resume(state)
         features = self.raw_features(state)
         if features is None or state.blocked:
             return
-        p = self.model_params
+        p = self.P()
         for s in SYMBOLS:
             top = state.top[s]
             if top.halted or not top.two_sided or self.last_mid[s] is None:
                 continue
             self.theo[s] = (self.last_mid[s] + self.predict(s, features[s]) + p[f"bias_{s}"]
-                            + self.news_lean(s, state.batch))
+                            + self.lean(s, state.batch)[0])
             if s in self.paused:
                 continue  # standing aside after news: its orders were pulled in on_news
             if not p[f"on_{s}"]:
@@ -278,13 +348,17 @@ class TheoMM(Strategy):
 
         # Take: cross when q is beyond the far side by the fee plus a margin, and sweep: the IOC's
         # limit is the worst price q still justifies, so it can take several levels at once.
-        # While a news move (move_<SYM>) is active, the margin is the lower of take and ntake.
+        # While a news lean is active and its source trades for real (team_trade / llm_trade = 2),
+        # the margin is the lower of take and ntake; an LLM take is LLM_TAKE_FRACTION of tsize.
         if self.messages_left() < 1:
             return
         margin = take
-        if self.news_lean(s, state.batch):
-            margin = min(margin, p[f"ntake_{s}"])
         tsize = int(p[f"tsize_{s}"])
+        lean, source = self.lean(s, state.batch)
+        if lean and source and int(p[f"{source}_trade"]) == 2:
+            margin = min(margin, p[f"ntake_{s}"])
+            if source == "llm":
+                tsize = max(1, round(tsize * LLM_TAKE_FRACTION))
         buy_limit = math.floor(q - TAKER_FEE_C - margin)
         sell_limit = math.ceil(q + TAKER_FEE_C + margin)
         if buy_limit >= top.ask_px and buy_limit < ask:  # (< our own ask: never trade with ourselves)
@@ -346,6 +420,10 @@ class TheoMM(Strategy):
             record[f"mid0_{s}"] = mid
             record[f"pred0_{s}"] = round(theo - mid, 2) if theo is not None and mid is not None else None
         self.news_records.append(record)
+        name = self.model_name()
+        if self.reader is not None and name:
+            record["llm_model"] = name
+            self.reader.read(item.news_id, name, item.headline, item.body)  # answers in drain_llm
 
     def track_news(self, batch: int) -> None:
         """Fill in each item's mid moves as their horizons pass; write an item once all are in."""
@@ -362,16 +440,7 @@ class TheoMM(Strategy):
 
     def write_news(self, r: dict) -> None:
         r["_done"] = True
-        try:
-            NEWS_LOG.parent.mkdir(exist_ok=True)
-            new = not NEWS_LOG.exists()
-            with NEWS_LOG.open("a", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=NEWS_FIELDS, extrasaction="ignore")
-                if new:
-                    w.writeheader()
-                w.writerow(r)
-        except OSError as e:  # never let logging stop trading
-            self.log.error("could not write %s: %s", NEWS_LOG, e)
+        append_row(NEWS_LOG, NEWS_FIELDS, r)  # never raises: logging must not stop trading
 
     def summarize_news(self, rows: list[dict], title: str) -> None:
         """One line per item: what it named, and each symbol's mid move at 5 s / 30 s / 60 s / 2 min."""
@@ -423,44 +492,287 @@ class TheoMM(Strategy):
         moved = abs(mids[-1] - mids[-1 - SETTLE_LOOKBACK])
         return top.spread <= SETTLE_SPREAD_X * usual + 1 and moved <= max(1.0, usual)
 
+    # ---- settings: GUI sliders and terminal commands ------------------------------------------
+
     def on_model_params(self, changed: dict) -> None:
-        """A move_<SYM> slider changed: the total move you expect, counted from the mid at the
-        latest news (if it was within MOVE_ANCHOR_WINDOW) or from the mid now. Setting one also
-        ends that symbol's news pause: you have decided."""
-        batch = self.state.batch if self.state is not None else 0
+        """Sliders changed in the GUI. A GUI change replaces anything typed for that setting."""
         for name, value in changed.items():
-            if not name.startswith("move_"):
-                continue
-            s = name.removeprefix("move_")
-            if s not in SYMBOLS:
-                continue
-            recent = self.news_batch is not None and batch - self.news_batch <= MOVE_ANCHOR_WINDOW
-            anchor = self.news_mid[s] if recent and self.news_mid[s] is not None else self.last_mid[s]
-            self.move_target[s] = float(value)
-            self.move_anchor[s] = anchor if value else None
-            self.move_set_at[s] = batch
-            if recent and self.news_records and value:
-                self.news_records[-1][f"slider_{s}"] = float(value)  # your read, kept beside the outcome
-            if value:
-                self.paused.discard(s)
-                self.log.warning("news move %s %+.1fc, counted from mid %.1f", s, value, anchor or 0)
-            else:
-                self.log.info("news move %s cleared", s)
+            self.overrides.pop(name, None)
+            self.param_changed(name, value, via="GUI")
+
+    def param_changed(self, name: str, value, via: str) -> None:
+        if name.startswith("move_") and name.removeprefix("move_") in SYMBOLS:
+            self.set_move(name.removeprefix("move_"), float(value), via)
+        elif name == "llm_model":
+            self.log.warning("LLM model -> %s (%s)", LLM_MODELS.get(int(value)) or "off", via)
+            self.warm_up_llm()
+        elif name in ("llm_trade", "team_trade"):
+            self.log.warning("%s -> %s (%s)", name, TRADE_MODES.get(int(value), value), via)
+        else:
+            self.log.info("%s -> %s (%s)", name, value, via)
+
+    def set_param(self, name: str, raw: str) -> None:
+        """A setting typed into the terminal: checked against the panel's kind and range."""
+        spec = self.SPECS.get(name)
+        if spec is None:
+            self.log.error("no setting %r (try `help`)", name)
+            return
+        try:
+            value = float(raw)
+        except ValueError:
+            self.log.error("%s needs a number, got %r", name, raw)
+            return
+        if spec.kind in (ParamKind.INT, ParamKind.BOOL):
+            if value != int(value):
+                self.log.error("%s takes whole numbers", name)
+                return
+            value = int(value)
+        lo, hi = (0, 1) if spec.kind is ParamKind.BOOL else (spec.min, spec.max)
+        if (lo is not None and value < lo) or (hi is not None and value > hi):
+            self.log.error("%s must be between %s and %s", name, lo, hi)
+            return
+        self.overrides[name] = value
+        self.param_changed(name, value, via="terminal")
+
+    def set_move(self, s: str, value: float, via: str) -> None:
+        """Your team's call on news: the total move expected, counted from the mid at the latest
+        news (if it was within MOVE_ANCHOR_WINDOW) or from the mid now. It replaces any LLM lean on
+        the symbol, ends its news pause (you have decided), and is paper-traded if team_trade >= 1."""
+        batch = self.state.batch if self.state is not None else 0
+        recent = self.news_batch is not None and batch - self.news_batch <= MOVE_ANCHOR_WINDOW
+        anchor = self.news_mid[s] if recent and self.news_mid[s] is not None else self.last_mid[s]
+        self.move_target[s] = value
+        self.move_anchor[s] = anchor if value else None
+        self.move_set_at[s] = batch
+        if self.llm_target[s]:
+            self.log.info("team move on %s replaces the LLM lean", s)
+        self.llm_target[s], self.llm_anchor[s] = 0.0, None
+        if recent and self.news_records and value:
+            self.news_records[-1][f"slider_{s}"] = value  # your read, kept beside the outcome
+        if not value:
+            self.log.info("news move %s cleared (%s)", s, via)
+            return
+        self.paused.discard(s)
+        mode = int(self.P()["team_trade"])
+        self.log.warning("news move %s %+.1fc, counted from mid %.1f (%s; team_trade %s)", s, value,
+                         anchor or 0, via, TRADE_MODES[mode])
+        if mode >= 1:
+            tsize = int(self.P()[f"tsize_{s}"])
+            self.add_paper("team", s, 1 if value > 0 else -1, tsize, None, real=mode == 2)
+
+    # ---- leans ------------------------------------------------------------------------------
+
+    def lean(self, s: str, batch: int) -> tuple[float, str | None]:
+        """The news lean in force on ``s`` and its source: your team's move_ if set, else the LLM's."""
+        team = self._remaining(s, batch, self.move_target, self.move_anchor, self.move_set_at, "news move")
+        if self.move_target[s]:
+            return team, "team" if team else None
+        llm = self._remaining(s, batch, self.llm_target, self.llm_anchor, self.llm_set_at, "LLM lean")
+        return llm, "llm" if llm else None
 
     def news_lean(self, s: str, batch: int) -> float:
-        """The part of the expected news move that has not happened yet (0 once it has, or expired)."""
-        target, anchor = self.move_target[s], self.move_anchor[s]
+        return self.lean(s, batch)[0]
+
+    def _remaining(self, s, batch, targets, anchors, set_at, what) -> float:
+        """The part of an expected move that has not happened yet (0 once it has, or expired)."""
+        target, anchor = targets[s], anchors[s]
         if not target or anchor is None or self.last_mid[s] is None:
             return 0.0
-        if batch - self.move_set_at[s] > MOVE_TTL:
-            self.log.info("news move %s expired (set it again to renew)", s)
-            self.move_target[s], self.move_anchor[s] = 0.0, None
+        if batch - set_at[s] > MOVE_TTL:
+            self.log.info("%s %s expired", what, s)
+            targets[s], anchors[s] = 0.0, None
             return 0.0
         remaining = target - (self.last_mid[s] - anchor)
         if remaining * target <= 0:
             return 0.0  # the market has moved that far already
-        # Never lean more than you entered: if the price goes the other way, your read may be wrong.
+        # Never lean more than was entered: if the price goes the other way, the read may be wrong.
         return max(remaining, target) if target < 0 else min(remaining, target)
+
+    # ---- the LLM ----------------------------------------------------------------------------
+
+    def drain_llm(self, state: BatchState) -> None:
+        if self.reader is None:
+            return
+        while True:
+            try:
+                r = self.reader.results.get_nowait()
+            except queue.Empty:
+                return
+            if r["kind"] == "warmup":
+                if r["error"]:
+                    self.llm_status = f"{r['model']}: UNAVAILABLE"
+                    self.log.error("LLM %s unavailable (%s): is Ollama running and the model pulled? "
+                                   "Trading goes on without it.", r["model"], r["error"])
+                else:
+                    self.llm_status = f"{r['model']}: ready"
+                    self.log.info("LLM %s ready (warm-up %.1fs)", r["model"], r["secs"])
+            else:
+                self.apply_read(state, r)
+
+    def apply_read(self, state: BatchState, r: dict) -> None:
+        """An LLM read arrived: log it, keep it beside the news record, and if it is confident
+        enough, lean (llm_size) and paper- or real-trade (llm_trade) the symbols it names."""
+        record = next((x for x in self.news_records if x["news_id"] == r["news_id"]), None)
+        if record is None:
+            return
+        named = record["named"].split()
+        dirs = interpret(r["dirs"], named)
+        p = self.P()
+        age = state.batch - record["batch"]
+        shown = " ".join(f"{s}{d:+d}" for s, d in dirs.items()) or "no direction"
+        use = (not r["error"] and dirs and r["conf"] >= p["llm_min"] and age <= LLM_MAX_AGE)
+        record.update({"llm_secs": round(r["secs"], 2), "llm_conf": r["conf"], "llm_reason": r["reason"],
+                       "llm_error": r["error"] or "", "llm_used": int(bool(use))})
+        for s in SYMBOLS:
+            record[f"llm_{s}"] = dirs.get(s, 0)
+        self.llm_reads.append({"minute": record["minute"], "headline": record["headline"], "dirs": dirs,
+                               "conf": r["conf"], "secs": r["secs"], "used": bool(use), "error": r["error"]})
+        if r["error"]:
+            self.log.error("LLM read failed after %.1fs (%s): %s", r["secs"], r["model"], r["error"])
+            return
+        why = ("" if use else " -> not used: " + ("stale" if age > LLM_MAX_AGE else
+               "no direction" if not dirs else f"confidence below llm_min {p['llm_min']:g}"))
+        self.log.warning("LLM (%s, %.1fs): %s conf %.2f - %s%s", r["model"], r["secs"], shown, r["conf"],
+                         r["reason"], why)
+        if not use:
+            return
+        size, mode = float(p["llm_size"]), int(p["llm_trade"])
+        for s, d in dirs.items():
+            if self.move_target[s]:
+                continue  # your team has already called this symbol: their call stands
+            if size > 0:
+                self.llm_target[s], self.llm_anchor[s] = d * size, record[f"mid0_{s}"]
+                self.llm_set_at[s] = state.batch
+            if mode >= 1:
+                tsize = max(1, round(int(p[f"tsize_{s}"]) * LLM_TAKE_FRACTION))
+                self.add_paper("llm", s, d, tsize, r["conf"], real=mode == 2)
+            if mode == 2:
+                self.paused.discard(s)  # real LLM takes go now, not after the news pause
+        leans = " ".join(f"{s}{self.llm_target[s]:+.0f}c" for s in dirs if self.llm_target[s])
+        if leans:
+            self.log.warning("LLM lean %s (llm_trade %s)", leans, TRADE_MODES[mode])
+
+    # ---- the paper book ---------------------------------------------------------------------
+
+    def add_paper(self, source: str, s: str, side: int, qty: int, conf: float | None, real: bool) -> None:
+        """The aggressive take a call implies: the touch on the far side. Always recorded in the
+        paper book; with ``real`` the same take is also sent (an IOC at the touch, within the caps),
+        so paper results are a faithful preview of real ones."""
+        state = self.state
+        if state is None:
+            return
+        top = state.top[s]
+        price = top.ask_px if side > 0 else top.bid_px
+        if top.halted or price is None or self.last_mid[s] is None:
+            return
+        news_id = self.news_records[-1]["news_id"] if self.news_records else None
+        self.paper.add(source=source, news_id=news_id, batch=state.batch, symbol=s, side=side, qty=qty,
+                       price=price, mid0=self.last_mid[s], conf=conf, real=real,
+                       session=self.session.session_id if self.session else "", mode=self.mode)
+        sent = self.news_take(state, s, side, qty, price) if real else 0
+        self.log.info("PAPER %s %s %s %d @ %d%s", source, "buy" if side > 0 else "sell", s, qty, price,
+                      f" (REAL: sent {sent})" if real else "")
+
+    def news_take(self, state: BatchState, s: str, side: int, qty: int, price: int) -> int:
+        """Send one IOC at ``price`` for up to ``qty`` within the position cap and exposure limit.
+        Our own resting orders on the other side at or through that price are cancelled first (the
+        exchange processes our messages in order), so the take never trades with ourselves."""
+        if not self.P()[f"on_{s}"] or state.blocked:
+            return 0
+        sd = Side.BUY if side > 0 else Side.SELL
+        qty = self.room(state, s, sd, qty)
+        if qty <= 0:
+            return 0
+        for o in self.open_orders(s):
+            crosses = o.price <= price if sd is Side.BUY else o.price >= price
+            if o.side is not sd and crosses and self.messages_left() > 1:
+                self.cancel(order_id=o.order_id)
+        if self.messages_left() < 1:
+            return 0
+        (self.buy if sd is Side.BUY else self.sell)(s, qty, price, ioc=True)
+        return qty
+
+    def mark_paper(self, state: BatchState) -> None:
+        for t in self.paper.update(state.batch, self.last_mid):
+            self.log.warning("PAPER %s %s %s %d @ %d: $%+.0f at 5 s, $%+.0f at 30 s, $%+.0f at 60 s "
+                             "(mid moved %+.1fc its way) | %s", t["source"], "buy" if t["side"] > 0 else "sell",
+                             t["symbol"], t["qty"], t["price"], t.get("pnl10", 0), t.get("pnl60", 0),
+                             t.get("pnl120", 0), t["move120"], self.paper.short())
+
+    # ---- terminal commands ------------------------------------------------------------------
+
+    def drain_commands(self, state: BatchState) -> None:
+        if self.commands is None:
+            return
+        while True:
+            try:
+                line = self.commands.lines.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self.run_command(state, line)
+            except Exception as e:  # a typo must never stop trading
+                self.log.error("command %r failed: %s", line, e)
+
+    def run_command(self, state: BatchState, line: str) -> None:
+        words = line.lower().split()
+        cmd, args = words[0], words[1:]
+        modes = {"off": 0, "paper": 1, "real": 2}
+        if cmd == "help":
+            for row in HELP.splitlines():
+                self.log.info(row)
+        elif cmd == "status":
+            self.print_status(state)
+        elif cmd == "news":
+            self.print_news()
+        elif cmd == "llm" and len(args) == 1 and args[0] in LLM_NAMES:
+            self.set_param("llm_model", str(LLM_NAMES[args[0]]))
+        elif cmd == "llm" and len(args) == 2 and args[0] in ("size", "min"):
+            self.set_param(f"llm_{args[0]}", args[1])
+        elif cmd in ("llm", "team") and len(args) == 2 and args[0] == "trade" and args[1] in modes:
+            self.set_param(f"{cmd}_trade", str(modes[args[1]]))
+        elif cmd == "move" and len(args) == 2 and args[0].upper() in SYMBOLS:
+            self.set_param(f"move_{args[0].upper()}", args[1])
+        elif cmd == "set" and len(args) == 2:
+            name = args[0]
+            for s in SYMBOLS:  # settings are typed in lower case: put the symbol back in capitals
+                if name.endswith("_" + s.lower()):
+                    name = name[: -len(s)] + s
+            self.set_param(name, args[1])
+        else:
+            self.log.error("unknown command %r: type `help`", line)
+
+    def print_status(self, state: BatchState) -> None:
+        p = self.P()
+        self.log.info("STATUS batch %d (minute %.1f) | exposure %+.0f | markouts $%.2f | LLM %s",
+                      state.batch, state.minute, state.exposure / 1000, sum(self.markouts().values()) / 100,
+                      self.llm_status)
+        self.log.info("  llm_model %s, llm_size %gc, llm_min %g, llm_trade %s, team_trade %s",
+                      LLM_MODELS.get(int(p["llm_model"])) or "off", p["llm_size"], p["llm_min"],
+                      TRADE_MODES[int(p["llm_trade"])], TRADE_MODES[int(p["team_trade"])])
+        for s in SYMBOLS:
+            lean, src = self.lean(s, state.batch)
+            self.log.info("  %s pos %+5d  theo-mid %+5.1fc  %s%s  on %d edge %g size %d tsize %d ntake %g",
+                          s, self.position(s),
+                          (self.theo.get(s, 0) - (self.last_mid[s] or 0)) if s in self.theo else 0,
+                          "PAUSED " if s in self.paused else "", f"lean {lean:+.1f}c ({src})" if lean else "no lean",
+                          int(p[f"on_{s}"]), p[f"edge_{s}"], int(p[f"size_{s}"]), int(p[f"tsize_{s}"]),
+                          p[f"ntake_{s}"])
+        if self.overrides:
+            self.log.info("  typed in the terminal (the GUI may show other values): %s", self.overrides)
+
+    def print_news(self) -> None:
+        self.log.info("NEWS DESK | %s", self.paper.short())
+        lines = self.paper.sensitivity()
+        if lines:
+            self.log.info("sensitivity (finished paper trades): how often each source was right, and how far "
+                          "the mid really moved its way at 60 s, the number to size llm_size and move_ from")
+            for row in lines:
+                self.log.info(row)
+        for r in self.llm_reads[-8:]:
+            shown = " ".join(f"{s}{d:+d}" for s, d in r["dirs"].items()) or "none"
+            self.log.info("  LLM min %5s %-22s conf %.2f %.1fs %s | %s", r["minute"], shown, r["conf"], r["secs"],
+                          "used" if r["used"] else ("ERROR" if r["error"] else "not used"), r["headline"][:60])
 
     # ---- bookkeeping ------------------------------------------------------------------------
 
@@ -475,16 +787,18 @@ class TheoMM(Strategy):
         for s in SYMBOLS:
             mid, theo = self.last_mid[s], self.theo.get(s)
             lean = f"{theo - mid:+.1f}c" if theo is not None and mid is not None else "-"
-            news = self.news_lean(s, state.batch)
-            flags = (" PAUSED" if s in self.paused else "") + (f" news{news:+.1f}c" if news else "")
+            news, src = self.lean(s, state.batch)
+            flags = (" PAUSED" if s in self.paused else "") + (f" {src}{news:+.1f}c" if news else "")
             parts.append(f"{s} {self.position(s):+d} ({lean}{flags})")
+        news_desk = f" | {self.paper.short()}" if self.paper.done or self.paper.open else ""
         self.log.info(
-            "minute %d: %s | exposure %+.0f | est PnL $%.2f | markouts so far $%.2f",
+            "minute %d: %s | exposure %+.0f | est PnL $%.2f | markouts so far $%.2f%s",
             (state.batch + 1) // REPORT_EVERY,
             "  ".join(parts),
             state.exposure / 1000,
             state.pnl_est_mills / 1000,
             sum(self.markouts().values()) / 100,
+            news_desk,
         )
 
     def markouts(self) -> dict[str, float]:
@@ -512,6 +826,13 @@ class TheoMM(Strategy):
             if not r["_done"]:
                 self.write_news(r)  # items too close to the end for every horizon: what there is
         self.summarize_news(self.news_records, f"news this session (saved to {NEWS_LOG.name})")
+        self.drain_llm(state)
+        self.paper.flush(self.last_mid)
+        if self.paper.done:
+            self.print_news()
+            self.log.info("  (paper trades saved to %s)", PAPER_LOG.name)
+        if self.reader is not None:
+            self.reader.close()
         marks = self.markouts()
         self.log.info("markouts (fills vs mid 60 s later, after fees; a proxy for the score):")
         for s in SYMBOLS:
