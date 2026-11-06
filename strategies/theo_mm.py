@@ -19,7 +19,10 @@ Each batch, for each symbol:
    When the theo leans one way, the side that would be picked off steps back by itself.
    A quote is moved (cancel-replace) only when its price should change, so it keeps its queue place.
 4. **Take.** When ``q`` is beyond the far side of the book by more than the taker fee plus
-   ``take_<SYM>`` cents, cross with an IOC.
+   ``take_<SYM>`` cents, cross with an IOC of ``tsize_<SYM>`` shares whose limit is the worst price
+   ``q`` still justifies, so it sweeps several levels if they are there. ``take`` is 50 (off) by
+   default; while a news move is active the margin is ``ntake_<SYM>`` (3c) instead, so setting
+   ``move_<SYM>`` makes it take aggressively toward your target until the price gets there.
 
 **News.** On every item it pulls all resting orders at once (``cancel_all``, one message) and
 stands aside in every symbol; each symbol resumes when its book has settled (spread near its usual
@@ -72,14 +75,16 @@ EXPOSURE_SOFT = 500  # HPPO-equivalent shares; the exchange's hard limit is 600
 #   take     cents beyond the fee before crossing (50 = never)
 #   skew     cents of lean at a CAP-sized position
 #   improve  ticks inside the best price (0 = join it)
+#   tsize    shares per take (IOC); a take sweeps every level up to the price q justifies
+#   ntake    the take margin while a news move (move_<SYM>) is active: setting move_ makes it take
 # From research/grid_search.py: skew and take as found (interior optimum / no difference);
 # edge and size one step back from the grid's boundary (the backtest's fill model rewards ever
 # tighter, ever bigger quotes); improve 1 (2 and 3 were worse even in the backtest).
 DEFAULTS = {
-    "HPPO": {"edge": 2.0, "size": 40, "take": 50.0, "skew": 10.0, "improve": 1},
-    "BNKY": {"edge": 1.0, "size": 100, "take": 50.0, "skew": 3.0, "improve": 1},
-    "CRRT": {"edge": 1.0, "size": 100, "take": 50.0, "skew": 3.0, "improve": 1},
-    "BRRY": {"edge": 3.0, "size": 30, "take": 50.0, "skew": 6.0, "improve": 1},
+    "HPPO": {"edge": 2.0, "size": 40, "take": 50.0, "skew": 10.0, "improve": 1, "tsize": 100, "ntake": 3.0},
+    "BNKY": {"edge": 1.0, "size": 100, "take": 50.0, "skew": 3.0, "improve": 1, "tsize": 250, "ntake": 3.0},
+    "CRRT": {"edge": 1.0, "size": 100, "take": 50.0, "skew": 3.0, "improve": 1, "tsize": 250, "ntake": 3.0},
+    "BRRY": {"edge": 3.0, "size": 30, "take": 50.0, "skew": 6.0, "improve": 1, "tsize": 60, "ntake": 3.0},
 }
 MAX_ORDER = {"HPPO": 200, "BNKY": 500, "CRRT": 500, "BRRY": 120}
 
@@ -118,6 +123,8 @@ def _params() -> tuple[ParamSpec, ...]:
             ParamSpec(f"improve_{s}", ParamKind.INT, d["improve"], 0, 5),
             ParamSpec(f"bias_{s}", ParamKind.FLOAT, 0.0, -50.0, 50.0),
             ParamSpec(f"move_{s}", ParamKind.FLOAT, 0.0, -100.0, 100.0),
+            ParamSpec(f"tsize_{s}", ParamKind.INT, d["tsize"], 1, MAX_ORDER[s]),
+            ParamSpec(f"ntake_{s}", ParamKind.FLOAT, d["ntake"], 0.0, 50.0),
         ]
     return tuple(specs)
 
@@ -260,16 +267,34 @@ class TheoMM(Strategy):
         ask = max(base_ask, math.ceil(q + edge), top.bid_px + 1)
         if ask <= bid:
             ask = bid + 1
-        self.keep_quote(s, Side.BUY, bid if buy_room > 0 else None, min(size, buy_room), mine)
-        self.keep_quote(s, Side.SELL, ask if sell_room > 0 else None, min(size, sell_room), mine)
+        # Move the quote that gets out of the way first: a bid moved up to (or past) our resting
+        # ask, before that ask moves, would trade with it (a self-trade: $0.10 a share).
+        quotes = [(Side.BUY, bid if buy_room > 0 else None, min(size, buy_room)),
+                  (Side.SELL, ask if sell_room > 0 else None, min(size, sell_room))]
+        if my_ask is not None and bid >= my_ask:
+            quotes.reverse()
+        for side, price, qty in quotes:
+            self.keep_quote(s, side, price, qty, mine)
 
-        # Take: cross only when q is beyond the far side by the fee plus a margin.
+        # Take: cross when q is beyond the far side by the fee plus a margin, and sweep: the IOC's
+        # limit is the worst price q still justifies, so it can take several levels at once.
+        # While a news move (move_<SYM>) is active, the margin is the lower of take and ntake.
         if self.messages_left() < 1:
             return
-        if q - top.ask_px > TAKER_FEE_C + take and buy_room > 0:
-            self.buy(s, min(size, top.ask_qty, buy_room), top.ask_px, ioc=True)
-        elif top.bid_px - q > TAKER_FEE_C + take and sell_room > 0:
-            self.sell(s, min(size, top.bid_qty, sell_room), top.bid_px, ioc=True)
+        margin = take
+        if self.news_lean(s, state.batch):
+            margin = min(margin, p[f"ntake_{s}"])
+        tsize = int(p[f"tsize_{s}"])
+        buy_limit = math.floor(q - TAKER_FEE_C - margin)
+        sell_limit = math.ceil(q + TAKER_FEE_C + margin)
+        if buy_limit >= top.ask_px and buy_limit < ask:  # (< our own ask: never trade with ourselves)
+            qty = self.room(state, s, Side.BUY, tsize)
+            if qty > 0:
+                self.buy(s, qty, buy_limit, ioc=True)
+        elif sell_limit <= top.bid_px and sell_limit > bid:
+            qty = self.room(state, s, Side.SELL, tsize)
+            if qty > 0:
+                self.sell(s, qty, sell_limit, ioc=True)
 
     def room(self, state: BatchState, s: str, side: Side, size: int) -> int:
         """Shares we may still add on ``side`` within CAP and the soft exposure limit."""
@@ -478,7 +503,7 @@ class TheoMM(Strategy):
             if ref is None:
                 continue
             sign = 1 if f.side == Side.BUY else -1
-            out[f.symbol] += sign * f.qty * (ref - f.price) - f.fee_mills / 10
+            out[f.symbol] += sign * f.qty * (ref - f.price) - f.fee_mills / 10 - f.penalty_mills / 10
         return out
 
     def on_end(self, state: BatchState) -> None:
